@@ -5,34 +5,10 @@
 // Cargo.toml must have:
 //   ibverbs     = "0.9.2"
 //   ibverbs-sys = "0.3"
-//
-// Key ibverbs-sys 0.3 conventions (all confirmed from source):
-//
-//  1. ibv_qp_state / ibv_qp_type / ibv_wr_opcode / ibv_wc_status / ibv_wc_opcode
-//     are CONSTIFIED MODULES — their members have type `::Type` (a u32 alias).
-//     Usage:  ibv_qp_state::IBV_QPS_INIT  (no .0 needed, it's already u32)
-//
-//  2. ibv_access_flags / ibv_qp_attr_mask / ibv_send_flags / ibv_wc_flags
-//     are BITFIELD STRUCTS — constants like ibv_access_flags::IBV_ACCESS_LOCAL_WRITE are
-//     ibv_access_flags(1u32).  Combine with | (operator implemented),
-//     and extract the raw integer with .0 when assigning to c_uint/i32.
-//
-//  3. ibv_mtu is a plain Rust ENUM.
-//     Fields expecting it (path_mtu) are u32 — cast with `as u32`.
-//
-//  4. ibv_wc.status and ibv_wc.wr_id are PRIVATE fields.
-//     Use provided methods: wc.wr_id(), wc.is_valid(), wc.error().
-//
-//  5. ibv_query_port expects *mut _compat_ibv_port_attr, not *mut ibv_port_attr.
-//     Cast:  &mut port_attr as *mut ibv_port_attr as *mut _compat_ibv_port_attr
-//
-//  6. ibv_post_send and ibv_poll_cq are C *inline* functions and NOT exported
-//     as Rust symbols.  Call them through the context ops function pointers:
-//       (*(*qp).context).ops.post_send.unwrap()(qp, wr, bad_wr)
-//       (*(*cq).context).ops.poll_cq.unwrap()(cq, n, wc)
 
 use ibverbs_sys::*;
 use std::ptr;
+use ibverbs_sys::IBV_MTU_2048;
 
 /// Everything RDMA for one endpoint (server or client).
 pub struct RdmaContext {
@@ -45,8 +21,14 @@ pub struct RdmaContext {
     pub buf:     *mut u8,
     pub buf_len: usize,
 
+    /// QP number — needed for the handshake.
     pub qpn:  u32,
+    /// Local identifier (IB). Zero for pure RoCE/SoftRoCE; use gid instead.
     pub lid:  u16,
+    /// GID (Global ID) — required for RoCE and SoftRoCE routing.
+    /// Queried from port 1, GID index 0 during construction.
+    pub gid:  ibv_gid,
+    /// Remote key — authorises RDMA access to this MR.
     pub rkey: u32,
 }
 
@@ -76,8 +58,6 @@ impl RdmaContext {
             );
             assert!(!buf.is_null(), "alloc_zeroed failed");
 
-            // ibv_access_flags is a bitfield struct; | is implemented,
-            // extract raw i32 with .0 for ibv_reg_mr's last argument.
             let access = (ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
                 | ibv_access_flags::IBV_ACCESS_REMOTE_READ
                 | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE).0 as i32;
@@ -104,7 +84,6 @@ impl RdmaContext {
             assert!(!qp.is_null(), "ibv_create_qp failed");
 
             // ── query port for LID ─────────────────────────────────────
-            // ibv_query_port expects *mut _compat_ibv_port_attr; cast explicitly.
             let mut port_attr: ibv_port_attr = std::mem::zeroed();
             let rc = ibv_query_port(
                 ctx,
@@ -113,11 +92,19 @@ impl RdmaContext {
             );
             assert_eq!(rc, 0, "ibv_query_port failed");
 
+            // ── query GID (required for RoCE / SoftRoCE) ──────────────
+            // GID index 0 is always populated. On InfiniBand this is the
+            // subnet-prefix + GUID. On RoCE/SoftRoCE it's an IPv6 address
+            // derived from the MAC. connect_rtr uses it to fill ah_attr.grh.
+            let mut gid: ibv_gid = std::mem::zeroed();
+            let rc = ibv_query_gid(ctx, 1, 0, &mut gid);
+            assert_eq!(rc, 0, "ibv_query_gid failed");
+
             let qpn  = (*qp).qp_num;
             let lid  = port_attr.lid;
             let rkey = (*mr).rkey;
 
-            Self { ctx, pd, mr, cq, qp, buf, buf_len, qpn, lid, rkey }
+            Self { ctx, pd, mr, cq, qp, buf, buf_len, qpn, lid, gid, rkey }
         }
     }
 
@@ -142,20 +129,35 @@ impl RdmaContext {
     }
 
     /// Transition QP INIT → RTR.
-    pub fn connect_rtr(&self, remote_qpn: u32, remote_lid: u16) {
+    ///
+    /// `remote_gid` is required for RoCE and SoftRoCE (GRH must be set).
+    /// For pure InfiniBand with LID routing, the GRH fields are ignored
+    /// by the HCA when `is_global` is 0 — but we always set it here so
+    /// the same code works for both IB and RoCE/SoftRoCE.
+    pub fn connect_rtr(&self, remote_qpn: u32, remote_lid: u16, remote_gid: ibv_gid) {
         unsafe {
             let mut attr: ibv_qp_attr = std::mem::zeroed();
             attr.qp_state           = ibv_qp_state::IBV_QPS_RTR;
-            // ibv_mtu is a plain Rust enum; path_mtu field is u32.
-            attr.path_mtu           = IBV_MTU_1024;
+            attr.path_mtu = IBV_MTU_2048;
             attr.dest_qp_num        = remote_qpn;
             attr.rq_psn             = 0;
             attr.max_dest_rd_atomic = 1;
             attr.min_rnr_timer      = 12;
-            attr.ah_attr.dlid       = remote_lid;
-            attr.ah_attr.sl         = 0;
+
+            // ── address handle ─────────────────────────────────────────
+            attr.ah_attr.dlid          = remote_lid;
+            attr.ah_attr.sl            = 0;
             attr.ah_attr.src_path_bits = 0;
-            attr.ah_attr.port_num   = 1;
+            attr.ah_attr.port_num      = 1;
+
+            // GRH (Global Routing Header) — mandatory for RoCE / SoftRoCE.
+            // is_global=1 tells the HCA to include a GRH in every packet.
+            attr.ah_attr.is_global     = 1;
+            attr.ah_attr.grh.dgid      = remote_gid;
+            attr.ah_attr.grh.sgid_index    = 0;  // use GID index 0 (same as query)
+            attr.ah_attr.grh.hop_limit     = 64; // standard TTL for RoCE
+            attr.ah_attr.grh.traffic_class = 0;
+            attr.ah_attr.grh.flow_label    = 0;
 
             let mask = (ibv_qp_attr_mask::IBV_QP_STATE
                 | ibv_qp_attr_mask::IBV_QP_AV
@@ -193,7 +195,7 @@ impl RdmaContext {
         }
     }
 
-    /// Post one RDMA READ work-request.
+    /// Post one RDMA READ (SIGNALED — generates a CQ completion).
     ///
     /// # Safety
     /// `local_offset + len` must lie within the registered MR.
@@ -220,8 +222,6 @@ impl RdmaContext {
         wr.wr.rdma.rkey        = remote_rkey;
 
         let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
-
-        // ibv_post_send is a C inline — call via QP context ops fn pointer.
         let rc = (*(*self.qp).context)
             .ops
             .post_send
@@ -233,11 +233,52 @@ impl RdmaContext {
         assert_eq!(rc, 0, "ibv_post_send (READ) failed");
     }
 
+    /// Post one RDMA READ (UNSIGNALED — no CQ completion generated).
+    ///
+    /// Use as the first WR in a two-WR batch; follow immediately with a
+    /// SIGNALED `post_read` so one `poll_one()` covers both DMAs.
+    ///
+    /// # Safety
+    /// `local_offset + len` must lie within the registered MR.
+    pub unsafe fn post_read_unsignaled(
+        &self,
+        wr_id:        u64,
+        local_offset: usize,
+        len:          u32,
+        remote_addr:  u64,
+        remote_rkey:  u32,
+    ) {
+        let mut sge: ibv_sge = std::mem::zeroed();
+        sge.addr   = self.buf as u64 + local_offset as u64;
+        sge.length = len;
+        sge.lkey   = (*self.mr).lkey;
+
+        let mut wr: ibv_send_wr = std::mem::zeroed();
+        wr.wr_id      = wr_id;
+        wr.opcode     = ibv_wr_opcode::IBV_WR_RDMA_READ;
+        wr.send_flags = 0; // NOT signaled — no CQ entry generated
+        wr.sg_list    = &mut sge;
+        wr.num_sge    = 1;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey        = remote_rkey;
+
+        let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
+        let rc = (*(*self.qp).context)
+            .ops
+            .post_send
+            .expect("post_send fn ptr is null")(
+                self.qp,
+                &mut wr,
+                &mut bad_wr,
+            );
+        assert_eq!(rc, 0, "ibv_post_send (UNSIGNALED READ) failed");
+    }
+
     /// Spin-poll CQ until one completion arrives. Returns the wr_id.
+    /// Panics if the completion status is not SUCCESS.
     pub fn poll_one(&self) -> u64 {
         unsafe {
             let mut wc: ibv_wc = std::mem::zeroed();
-            // ibv_poll_cq is a C inline — call via CQ context ops fn pointer.
             let poll_fn = (*(*self.cq).context)
                 .ops
                 .poll_cq
@@ -245,7 +286,6 @@ impl RdmaContext {
             loop {
                 let n = poll_fn(self.cq, 1, &mut wc);
                 if n > 0 {
-                    // wc.status and wc.wr_id are private; use accessor methods.
                     assert!(wc.is_valid(), "CQ error: {:?}", wc.error());
                     return wc.wr_id();
                 }

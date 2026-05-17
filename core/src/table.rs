@@ -42,10 +42,11 @@ impl Slot {
         }
     }
 
-    /// True if this slot holds a real entry (non-zero key).
+    /// True if this slot holds a real entry.
+    /// ver_lo is non-zero and even = a completed write has occurred.
     #[inline]
     pub fn is_occupied(&self) -> bool {
-        self.key != [0u8; 24]
+        self.ver_lo != 0 && self.ver_lo & 1 == 0
     }
 }
 
@@ -67,16 +68,19 @@ pub fn h2(key: &[u8; 24]) -> usize {
 /// # Safety
 /// Must only be called by one writer at a time for a given slot.
 pub unsafe fn write_slot(slot: &mut Slot, key: &[u8; 24], val: &[u8; 24]) {
-    // Odd ver_lo = write in progress.
-    let seq = slot.ver_lo.wrapping_add(1);
-    ptr::write_volatile(&mut slot.ver_lo, seq);
+    // Increment to odd = write in progress.
+    let seq_odd  = (slot.ver_lo & !1).wrapping_add(1); // always odd
+    let seq_even = seq_odd.wrapping_add(1);             // always even = done
+    ptr::write_volatile(&mut slot.ver_lo, seq_odd);
     fence(Ordering::Release);
 
     slot.key   = *key;
     slot.value = *val;
 
     fence(Ordering::Release);
-    ptr::write_volatile(&mut slot.ver_hi, seq);
+    // Write even value to both halves — reader sees lo==hi, both even = clean.
+    ptr::write_volatile(&mut slot.ver_lo, seq_even);
+    ptr::write_volatile(&mut slot.ver_hi, seq_even);
 }
 
 /// Read key+value from slot using seqlock retry.
@@ -85,8 +89,8 @@ pub unsafe fn write_slot(slot: &mut Slot, key: &[u8; 24], val: &[u8; 24]) {
 pub fn read_slot(slot: &Slot) -> Option<([u8; 24], [u8; 24])> {
     for _ in 0..16 {
         let lo = unsafe { ptr::read_volatile(&slot.ver_lo) };
-        // Odd lo means write in progress — spin.
-        if lo & 1 != 0 { std::hint::spin_loop(); continue; }
+        // Odd = write in progress. Zero = never written (empty slot).
+        if lo & 1 != 0 || lo == 0 { std::hint::spin_loop(); continue; }
 
         fence(Ordering::Acquire);
         let key   = slot.key;
@@ -94,99 +98,156 @@ pub fn read_slot(slot: &Slot) -> Option<([u8; 24], [u8; 24])> {
         fence(Ordering::Acquire);
 
         let hi = unsafe { ptr::read_volatile(&slot.ver_hi) };
-        if lo == hi { return Some((key, value)); }
-        // Mismatch — writer was concurrent. Retry.
+        // Clean: lo == hi, both even, both non-zero.
+        if lo == hi && lo & 1 == 0 { return Some((key, value)); }
         std::hint::spin_loop();
     }
-    None // extremely rare; caller should retry the whole GET
+    None
 }
 
 // ── Table ─────────────────────────────────────────────────────────────────
 
 /// Cuckoo hash table: two arrays of `cap` slots each (steps 8–10).
+///
+/// Supports two ownership modes:
+///   - **Owned** (`Table::new`): allocates two `Vec<Slot>` internally.
+///     Used in tests and any context without a pre-existing MR buffer.
+///   - **Borrowed** (`Table::from_mr`): raw pointers into an externally
+///     owned buffer (e.g. the RDMA MR allocation). The caller is
+///     responsible for ensuring the buffer outlives the `Table`.
+///
 /// `cap` must be a power of two.
 pub struct Table {
-    slots_a: Vec<Slot>,
-    slots_b: Vec<Slot>,
-    pub cap:     usize,
+    slots_a: *mut Slot,
+    slots_b: *mut Slot,
+    pub cap: usize,
+    /// `Some((vec_a, vec_b))` when the table owns its memory.
+    /// `None` when the table borrows a raw MR buffer.
+    _owned:  Option<(Vec<Slot>, Vec<Slot>)>,
 }
 
+unsafe impl Send for Table {}
+unsafe impl Sync for Table {}
+
 impl Table {
+    /// Allocate an owned table (used in tests and pre-Phase-4 paths).
     pub fn new(cap: usize) -> Self {
         assert!(cap.is_power_of_two(), "cap must be a power of two");
-        let make = |n| (0..n).map(|_| Slot::zeroed()).collect::<Vec<_>>();
-        Self { slots_a: make(cap), slots_b: make(cap), cap }
+        let mut a: Vec<Slot> = (0..cap).map(|_| Slot::zeroed()).collect();
+        let mut b: Vec<Slot> = (0..cap).map(|_| Slot::zeroed()).collect();
+        let pa = a.as_mut_ptr();
+        let pb = b.as_mut_ptr();
+        Self { slots_a: pa, slots_b: pb, cap, _owned: Some((a, b)) }
     }
 
-    /// Pointer to the first byte of slots_a (used when registering the MR).
-    pub fn slots_a_ptr(&self) -> *const u8 { self.slots_a.as_ptr() as *const u8 }
-    /// Pointer to the first byte of slots_b.
-    pub fn slots_b_ptr(&self) -> *const u8 { self.slots_b.as_ptr() as *const u8 }
+    /// Borrow a table over a raw MR buffer (Phase 3+).
+    ///
+    /// `buf` must point to at least `cap * 2 * 64` contiguous, aligned bytes.
+    /// The first `cap` slots map to table A; the next `cap` slots to table B.
+    /// The caller owns the buffer lifetime — this `Table` must not outlive it.
+    ///
+    /// # Safety
+    /// - `buf` must be valid, non-null, and aligned to 64 bytes.
+    /// - `buf` must remain live for the lifetime of this `Table`.
+    /// - No other writer may concurrently mutate the buffer unless the seqlock
+    ///   protocol is respected.
+    pub unsafe fn from_mr(buf: *mut u8, cap: usize) -> Self {
+        assert!(cap.is_power_of_two(), "cap must be a power of two");
+        let pa = buf as *mut Slot;
+        let pb = (buf as *mut Slot).add(cap);
+        Self { slots_a: pa, slots_b: pb, cap, _owned: None }
+    }
 
-    /// Insert key→value. Returns true on success, false if the eviction
-    /// chain exceeded 512 iterations (caller must rehash).
+    /// Pointer to the first byte of slots_a (for MR registration).
+    pub fn slots_a_ptr(&self) -> *const u8 { self.slots_a as *const u8 }
+
+    /// Pointer to the first byte of slots_b (for MR registration / PeerInfo).
+    pub fn slots_b_ptr(&self) -> *const u8 { self.slots_b as *const u8 }
+
+    /// Insert key→value. Returns `true` on success, `false` if the eviction
+    /// chain exceeded 512 iterations (caller must rehash / resize).
     pub fn insert(&mut self, key: &[u8; 24], value: &[u8; 24]) -> bool {
-        // Already present? Update in place.
         let ia = h1(key) & (self.cap - 1);
         let ib = h2(key) & (self.cap - 1);
 
-        if self.slots_a[ia].is_occupied() && &self.slots_a[ia].key == key {
-            unsafe { write_slot(&mut self.slots_a[ia], key, value); }
-            return true;
-        }
-        if self.slots_b[ib].is_occupied() && &self.slots_b[ib].key == key {
-            unsafe { write_slot(&mut self.slots_b[ib], key, value); }
-            return true;
+        // Fast-path: update in place if key already exists.
+        unsafe {
+            let sa = &mut *self.slots_a.add(ia);
+            let sb = &mut *self.slots_b.add(ib);
+            if sa.is_occupied() && &sa.key == key {
+                write_slot(sa, key, value);
+                return true;
+            }
+            if sb.is_occupied() && &sb.key == key {
+                write_slot(sb, key, value);
+                return true;
+            }
         }
 
-        // New key — eviction chain.
+        // Slow-path: eviction chain.
         let mut cur_key   = *key;
         let mut cur_value = *value;
-        let mut use_a = true; // which table to try inserting into
+        let mut use_a     = true;
 
         for _ in 0..512 {
-            if use_a {
-                let i = h1(&cur_key) & (self.cap - 1);
-                if !self.slots_a[i].is_occupied() {
-                    unsafe { write_slot(&mut self.slots_a[i], &cur_key, &cur_value); }
-                    return true;
+            unsafe {
+                if use_a {
+                    let i = h1(&cur_key) & (self.cap - 1);
+                    let s = &mut *self.slots_a.add(i);
+                    if !s.is_occupied() {
+                        write_slot(s, &cur_key, &cur_value);
+                        return true;
+                    }
+                    let ek = s.key;
+                    let ev = s.value;
+                    write_slot(s, &cur_key, &cur_value);
+                    cur_key   = ek;
+                    cur_value = ev;
+                    use_a     = false;
+                } else {
+                    let i = h2(&cur_key) & (self.cap - 1);
+                    let s = &mut *self.slots_b.add(i);
+                    if !s.is_occupied() {
+                        write_slot(s, &cur_key, &cur_value);
+                        return true;
+                    }
+                    let ek = s.key;
+                    let ev = s.value;
+                    write_slot(s, &cur_key, &cur_value);
+                    cur_key   = ek;
+                    cur_value = ev;
+                    use_a     = true;
                 }
-                // Evict.
-                let evicted_key   = self.slots_a[i].key;
-                let evicted_value = self.slots_a[i].value;
-                unsafe { write_slot(&mut self.slots_a[i], &cur_key, &cur_value); }
-                cur_key   = evicted_key;
-                cur_value = evicted_value;
-                use_a = false;
-            } else {
-                let i = h2(&cur_key) & (self.cap - 1);
-                if !self.slots_b[i].is_occupied() {
-                    unsafe { write_slot(&mut self.slots_b[i], &cur_key, &cur_value); }
-                    return true;
-                }
-                let evicted_key   = self.slots_b[i].key;
-                let evicted_value = self.slots_b[i].value;
-                unsafe { write_slot(&mut self.slots_b[i], &cur_key, &cur_value); }
-                cur_key   = evicted_key;
-                cur_value = evicted_value;
-                use_a = true;
             }
         }
         false // eviction cycle — caller must rehash
     }
 
-    /// Look up `key`. Returns the value if found.
+    /// Look up `key`. Returns the value bytes if found.
     pub fn get(&self, key: &[u8; 24]) -> Option<[u8; 24]> {
         let ia = h1(key) & (self.cap - 1);
         let ib = h2(key) & (self.cap - 1);
 
-        if let Some((k, v)) = read_slot(&self.slots_a[ia]) {
-            if &k == key { return Some(v); }
-        }
-        if let Some((k, v)) = read_slot(&self.slots_b[ib]) {
-            if &k == key { return Some(v); }
+        unsafe {
+            if let Some((k, v)) = read_slot(&*self.slots_a.add(ia)) {
+                if &k == key { return Some(v); }
+            }
+            if let Some((k, v)) = read_slot(&*self.slots_b.add(ib)) {
+                if &k == key { return Some(v); }
+            }
         }
         None
+    }
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        // Owned mode: the Vec<Slot> pair inside _owned drops here, freeing
+        // the heap allocation.  The raw pointers (slots_a / slots_b) become
+        // dangling at that point but are never touched again.
+        //
+        // Borrowed mode (_owned == None): nothing to free; the caller owns
+        // the MR buffer and is responsible for its deallocation.
     }
 }
 
@@ -209,8 +270,7 @@ mod tests {
 
     #[test]
     fn insert_and_read_50k() {
-        // 100K slots total, insert 50K → 50% load factor.
-        let mut t = Table::new(1 << 17); // 131072 slots per half
+        let mut t = Table::new(1 << 17); // 131 072 slots per half
         for i in 0u64..50_000 {
             assert!(t.insert(&make_key(i), &make_val(i)), "insert failed at {i}");
         }
@@ -234,5 +294,37 @@ mod tests {
         let (rk, rv) = read_slot(&slot).unwrap();
         assert_eq!(rk, k);
         assert_eq!(rv, v);
+    }
+
+    #[test]
+    fn from_mr_roundtrip() {
+        // Allocate a raw buffer mimicking the MR layout and verify from_mr
+        // produces correct insert/get behaviour.
+        let cap  = 1usize << 10; // 1024 slots per half
+        let size = cap * 2 * std::mem::size_of::<Slot>();
+        let buf  = unsafe {
+            std::alloc::alloc_zeroed(
+                std::alloc::Layout::from_size_align(size, 64).unwrap(),
+            )
+        };
+        assert!(!buf.is_null());
+
+        let mut t = unsafe { Table::from_mr(buf, cap) };
+        for i in 0u64..500 {
+            assert!(t.insert(&make_key(i), &make_val(i * 10)), "insert failed at {i}");
+        }
+        for i in 0u64..500 {
+            let v = t.get(&make_key(i)).expect("key missing in from_mr table");
+            assert_eq!(u64::from_le_bytes(v[..8].try_into().unwrap()), i * 10);
+        }
+
+        // Drop the table first (borrowed — nothing freed), then free the buffer.
+        drop(t);
+        unsafe {
+            std::alloc::dealloc(
+                buf,
+                std::alloc::Layout::from_size_align(size, 64).unwrap(),
+            );
+        }
     }
 }

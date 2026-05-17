@@ -1,27 +1,31 @@
 // core/src/handshake.rs
 //
-// Step 5: TCP control channel that exchanges QPN, LID, rkey, and buffer VA.
-// Both sides send their PeerInfo and receive the remote's PeerInfo.
-// After this completes, the TCP socket is dropped — all further
-// communication is one-sided RDMA.
+// Step 5: TCP control channel that exchanges QPN, LID, GID, rkey, and buffer VA.
+// After this completes the TCP socket is dropped — all further communication
+// is one-sided RDMA.
 
 use std::net::{TcpListener, TcpStream};
 use std::io::{BufReader, Write};
 use serde::{Deserialize, Serialize};
-use crate::rdma_context::RdmaContext;
+use ibverbs_sys::ibv_gid;
+use crate::rdma_context::{RdmaContext};
+
 /// All the information a peer needs to issue RDMA READ/WRITE ops
 /// against our memory region.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     /// QP number — needed to address the remote QP.
     pub qpn: u32,
-    /// Local identifier (IB) or GID index (RoCE) of the port.
+    /// Local identifier (IB). Zero on pure RoCE/SoftRoCE — use gid instead.
     pub lid: u16,
+    /// GID — required for RoCE and SoftRoCE routing (fills GRH in ah_attr).
+    /// Serialised as a 16-byte array (big-endian IPv6 / IB GID format).
+    pub gid: [u8; 16],
     /// Remote key — authorises RDMA access to the MR.
     pub rkey: u32,
-    /// Virtual address of the beginning of the MR buffer.
+    /// Virtual address of the beginning of the MR buffer (slots_a base).
     pub addr: u64,
-    /// Virtual address of the second cuckoo table half (slots_b).
+    /// Virtual address of the second cuckoo table half (slots_b base).
     /// Zero until Phase 3; set when the hash table is the MR.
     pub addr_b: u64,
     /// Length of the registered buffer in bytes.
@@ -30,20 +34,30 @@ pub struct PeerInfo {
 
 impl PeerInfo {
     pub fn from_ctx(ctx: &RdmaContext) -> Self {
+        // ibv_gid is a union { raw: [u8;16], global: { subnet_prefix, interface_id } }.
+        // Access the raw bytes via the `raw` field.
+        let gid_bytes = unsafe { ctx.gid.raw };
         PeerInfo {
             qpn:    ctx.qpn,
             lid:    ctx.lid,
+            gid:    gid_bytes,
             rkey:   ctx.rkey,
             addr:   ctx.buf as u64,
             addr_b: 0,
             len:    ctx.buf_len as u64,
         }
     }
+
+    /// Convert the serialised gid bytes back into ibv_gid for connect_rtr.
+    pub fn ibv_gid(&self) -> ibv_gid {
+        let mut g: ibv_gid = unsafe { std::mem::zeroed() };
+        unsafe { g.raw = self.gid };
+        g
+    }
 }
 
-/// Server side: listen on `addr`, accept one connection, exchange PeerInfo,
-/// return the remote's PeerInfo.
-pub fn run_server_handshake(ctx: &RdmaContext, listen_addr: &str) -> PeerInfo {
+/// Server side: listen on `addr`, accept one connection, exchange PeerInfo.
+pub fn run_server_handshake(ctx: &RdmaContext, listen_addr: &str,addr_b: u64,) -> PeerInfo {
     let listener = TcpListener::bind(listen_addr)
         .unwrap_or_else(|e| panic!("bind {listen_addr}: {e}"));
     tracing::info!("Handshake: listening on {listen_addr}");
@@ -55,8 +69,7 @@ pub fn run_server_handshake(ctx: &RdmaContext, listen_addr: &str) -> PeerInfo {
     exchange(ctx, stream)
 }
 
-/// Client side: connect to the server's `server_addr`, exchange PeerInfo,
-/// return the remote's PeerInfo.
+/// Client side: connect to server, exchange PeerInfo.
 pub fn run_client_handshake(ctx: &RdmaContext, server_addr: &str) -> PeerInfo {
     let stream = TcpStream::connect(server_addr)
         .unwrap_or_else(|e| panic!("connect {server_addr}: {e}"));
@@ -65,17 +78,14 @@ pub fn run_client_handshake(ctx: &RdmaContext, server_addr: &str) -> PeerInfo {
     exchange(ctx, stream)
 }
 
-/// Send our PeerInfo, receive the remote's PeerInfo over `stream`.
+/// Send our PeerInfo, receive the remote's PeerInfo (newline-delimited JSON).
 fn exchange(ctx: &RdmaContext, mut stream: TcpStream) -> PeerInfo {
     let local = PeerInfo::from_ctx(ctx);
 
-    // Send ours first (newline-delimited JSON, one line).
     let mut json = serde_json::to_string(&local).unwrap();
     json.push('\n');
-    stream.write_all(json.as_bytes())
-        .expect("handshake: write failed");
+    stream.write_all(json.as_bytes()).expect("handshake: write failed");
 
-    // Read the remote's PeerInfo.
     let reader = BufReader::new(&stream);
     use std::io::BufRead;
     let mut line = String::new();
